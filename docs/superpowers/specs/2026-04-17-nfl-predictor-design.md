@@ -87,6 +87,16 @@ Synced weekly. Rarely changes mid-season.
 
 Recomputed weekly after games finalize.
 
+**Last-3 computation:** `last_3_avg_points` and `last_3_avg_allowed` are the average points scored/allowed in the team's 3 most recent finalized games, ordered by `start_time`. If fewer than 3 games have been played, use all available games (minimum 1). For a team with 0 games, these default to 0.
+
+### Indexes
+
+Suggested indexes for common query patterns:
+- `games`: `(season, status)`, `(season, season_type, week)`, `(home_team_id)`, `(away_team_id)`
+- `team_stats`: `(team_id, season)` — also the unique constraint
+- `predictions`: `(game_id)` — also the unique constraint
+- `prediction_results`: `(prediction_id)` — also the unique constraint
+
 ### `predictions`
 
 | Column              | Type       | Notes                                    |
@@ -132,13 +142,18 @@ Recomputed weekly after games finalize.
 
 The `/api/sync` route orchestrates these steps in order:
 
+**Concurrency control:** On start, write a `sync_log` entry with `step='sync_run', status='running'`. If a `status='running'` entry already exists (created in the last 30 minutes), return early to prevent concurrent syncs. On completion, update this entry to `status='success'` or `status='error'`.
+
 1. **Fetch teams** — `GET .../nfl/teams` → upsert into `teams`
    - If this step fails, log error and **skip all downstream steps** (they depend on team data)
    - Retry: 3 attempts with exponential backoff (1s, 2s, 4s)
-2. **Fetch schedule** — For each week (1-18) in the current season type, call `GET .../nfl/scoreboard?week=N&season=YYYY&seasontype=X`
-   - This requires ~20 HTTP calls per full sync (18 regular + 4-5 postseason weeks)
+2. **Fetch schedule** — For each week in the current season, call `GET .../nfl/scoreboard?week=N&season=YYYY&seasontype=X`
+   - Regular season: fetch weeks 1-18 (`seasontype=2`)
+   - Postseason: fetch weeks 1-5 (`seasontype=3`), stop at the first empty response (no more playoff weeks)
+   - This requires ~20 HTTP calls per full sync (18 regular + 2-5 postseason weeks)
    - Each week's response is processed independently — one failure doesn't block other weeks
-   - ESPN API responses are validated: required fields (`id`, `status`, `competitions`) must exist. Missing fields are logged and the game is skipped.
+   - ESPN API responses are validated with zod schemas: required fields (`id`, `status`, `competitions`) must exist. Missing fields are logged and the game is skipped.
+   - `tv_network` extracted from `competitions[0].broadcasts[0].names[0]` in the ESPN response (nullable — not all games have broadcast data)
 3. **Finalize past games** — For games now `status=final`, update scores. Games with `status=postponed` or `cancelled` are updated but excluded from stat computation.
 4. **Compute team_stats (pass 1)** — Aggregate from finalized games: wins/losses/ties, points, home/away splits, streaks
 5. **Compute team_stats (pass 2: strength of schedule)** — Requires all teams' pass-1 stats to be complete. For each team, compute opponents' combined win %. This is a separate pass because SoS depends on other teams' data.
@@ -160,7 +175,9 @@ WHERE season = EXTRACT(YEAR FROM NOW())
 ORDER BY season_type, week
 LIMIT 1;
 ```
-This returns the next week with scheduled games. If no scheduled games exist (off-season), show the last completed week.
+This returns the next week with scheduled games.
+
+**Off-season state:** If no scheduled games exist for the current year at all (Feb-August), the predictions page shows an off-season message: "The season hasn't started yet. Check back in September." The accuracy page continues to display last season's final accuracy data.
 
 ### Cron Schedule (Railway cron)
 
@@ -184,11 +201,11 @@ Each factor is normalized to a 0-1 scale before weighting:
 | Factor                    | Weight | Source                                         | Normalization                                   |
 |---------------------------|--------|------------------------------------------------|-------------------------------------------------|
 | Win percentage            | 15%    | wins / games_played                            | Already 0-1                                      |
-| Point differential        | 20%    | (points_scored - points_allowed) / games_played | Divide by 20, clamp to [-1, 1], remap to [0, 1] |
-| Recent form               | 20%    | last_3_avg_points - last_3_avg_allowed         | Divide by 14, clamp to [-1, 1], remap to [0, 1] |
+| Point differential        | 20%    | (points_scored - points_allowed) / games_played | Divide by 20, clamp to [-1, 1], remap: `(clamped + 1) / 2` |
+| Recent form               | 20%    | last_3_avg_points - last_3_avg_allowed         | Divide by 14, clamp to [-1, 1], remap: `(clamped + 1) / 2` |
 | Home field advantage      | 15%    | Fixed bonus applied to home team               | 0.55 for home team, 0.45 for away team           |
-| Strength of schedule      | 15%    | opponents' combined win %                      | Already 0-1                                      |
-| Head-to-head              | 15%    | Win % in last 5 matchups                       | Already 0-1, default 0.5 if no matchups exist    |
+| Strength of schedule      | 15%    | opponents' combined win %                      | Already 0-1. If any opponent has 0 games played, their win % defaults to 0.5 (neutral) for SoS computation. |
+| Head-to-head              | 15%    | Win % in last 5 matchups                       | Already 0-1, default 0.5 if no matchups exist. **Source:** queried at prediction time from `games` table by matching past finalized games where both teams played. |
 
 ### Algorithm
 
@@ -273,7 +290,7 @@ Tailwind v4 with `@import "tailwindcss"` in globals.css. Theme colors as CSS cus
 ### Frontend error states
 
 - **No data / sync never run:** Show a "season hasn't started" or "data loading" state with a clear message
-- **Stale data:** If the most recent `sync_log` entry is > 24 hours old, show a subtle banner: "Data may be outdated — last sync: [timestamp]"
+- **Stale data:** Check for the most recent `sync_log` entry where `step='sync_run' AND status='success'`. If that timestamp is > 24 hours ago, show a subtle banner: "Data may be outdated — last sync: [timestamp]"
 - **Missing predictions for a game:** Show the game card without a prediction section, just teams and game time
 
 ### Backend error handling
