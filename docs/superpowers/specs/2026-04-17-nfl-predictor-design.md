@@ -188,7 +188,7 @@ Railway cron cannot conditionally activate on game days. Instead:
 - **No-op optimization:** If no games are `in_progress` and the last sync was < 4 hours ago with no `scheduled` games within 24 hours, return early without hitting ESPN
 - This means ~48 sync attempts/day, but most are no-ops costing negligible resources
 
-The sync endpoint is protected by a `SYNC_SECRET` bearer token to prevent unauthorized runs.
+The sync endpoint is protected by a `SYNC_SECRET` bearer token to prevent unauthorized runs. Railway cron must pass this as `Authorization: Bearer <SYNC_SECRET>` in the HTTP request header.
 
 ## Prediction Algorithm
 
@@ -238,7 +238,7 @@ blended_value = current_value * (games_played / 4) + prev_value * (1 - games_pla
 - Week 4: 25% previous, 75% current
 - Week 5+: 100% current season
 
-If no previous season data exists, default all normalized factor scores to 0.5 (neutral) and set confidence to LOW.
+**Simple fallback:** If previous season data isn't cleanly available (no `team_stats` row for that team last year), fall back to 50/50 neutral (all factor scores = 0.5) with LOW confidence. Do not attempt complex decay logic — keep it simple.
 
 ## Frontend
 
@@ -252,7 +252,7 @@ Dark sportsbook style:
 - Primary text: `#e0e0e0`
 - Secondary text: `#888`
 
-Tailwind v4 with `@import "tailwindcss"` in globals.css. Theme colors as CSS custom properties.
+Tailwind v4 with `@import "tailwindcss"` in globals.css. **Never use `@tailwind` directives** (e.g., `@tailwind base`, `@tailwind components`, `@tailwind utilities`) — Tailwind v4 uses only the single `@import` statement. Theme colors as CSS custom properties.
 
 ### Page 1: Weekly Predictions Board (`/`)
 
